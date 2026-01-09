@@ -71,6 +71,7 @@ class TestGkeCodeExecutor:
     assert executor.timeout_seconds == 300
     assert executor.cpu_requested == "200m"
     assert executor.mem_limit == "512Mi"
+    assert executor.executor_type == "job"
 
   def test_init_with_overrides(self):
     """Tests that class attributes can be overridden at instantiation."""
@@ -79,11 +80,13 @@ class TestGkeCodeExecutor:
         image="custom-python:latest",
         timeout_seconds=60,
         cpu_limit="1000m",
+        executor_type="sandbox",
     )
     assert executor.namespace == "test-ns"
     assert executor.image == "custom-python:latest"
     assert executor.timeout_seconds == 60
     assert executor.cpu_limit == "1000m"
+    assert executor.executor_type == "sandbox"
 
   @patch("google.adk.code_executors.gke_code_executor.Watch")
   def test_execute_code_success(
@@ -225,3 +228,77 @@ class TestGkeCodeExecutor:
     assert sec_context.allow_privilege_escalation is False
     assert sec_context.read_only_root_filesystem is True
     assert sec_context.capabilities.drop == ["ALL"]
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  def test_execute_code_forks_to_sandbox(
+      self,
+      mock_sandbox_client,
+      mock_invocation_context,
+      mock_k8s_clients,
+  ):
+    """Tests that execute_code uses SandboxClient when executor_type='sandbox'."""
+    # Setup Sandbox mock
+    mock_sandbox_instance = (
+        mock_sandbox_client.return_value.__enter__.return_value
+    )
+    mock_run_result = MagicMock()
+    mock_run_result.stdout = "sandbox stdout"
+    mock_run_result.stderr = None
+    mock_sandbox_instance.run.return_value = mock_run_result
+
+    # Instantiate with sandbox type
+    executor = GkeCodeExecutor(executor_type="sandbox")
+    code_input = CodeExecutionInput(code='print("sandbox")')
+
+    # Execute
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    # Assertions
+    assert result.stdout == "sandbox stdout"
+
+    # Verify SandboxClient was used
+    mock_sandbox_client.assert_called_once()
+    mock_sandbox_instance.run.assert_called_once()
+
+    # Verify Job path was NOT taken
+    mock_k8s_clients["batch_v1"].create_namespaced_job.assert_not_called()
+
+  @patch("google.adk.code_executors.gke_code_executor.SandboxClient")
+  @patch("google.adk.code_executors.gke_code_executor.Watch")
+  def test_execute_code_forks_to_job(
+      self,
+      mock_watch,
+      mock_sandbox_client,
+      mock_invocation_context,
+      mock_k8s_clients,
+  ):
+    """Tests that execute_code uses K8s Job when executor_type='job'."""
+    # Setup K8s Job mocks (success path)
+    mock_job = MagicMock()
+    mock_job.status.succeeded = True
+    mock_watch.return_value.stream.return_value = [{"object": mock_job}]
+
+    mock_pod = MagicMock()
+    mock_pod.metadata.name = "pod-1"
+    mock_k8s_clients["core_v1"].list_namespaced_pod.return_value.items = [
+        mock_pod
+    ]
+    mock_k8s_clients["core_v1"].read_namespaced_pod_log.return_value = (
+        "job stdout"
+    )
+
+    # Instantiate with job type
+    executor = GkeCodeExecutor(executor_type="job")
+    code_input = CodeExecutionInput(code='print("job")')
+
+    # Execute
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    # Assertions
+    assert result.stdout == "job stdout"
+
+    # Verify Job path WAS taken
+    mock_k8s_clients["batch_v1"].create_namespaced_job.assert_called_once()
+
+    # Verify SandboxClient was NOT used
+    mock_sandbox_client.assert_not_called()
