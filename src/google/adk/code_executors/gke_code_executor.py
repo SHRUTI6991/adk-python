@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 import uuid
 
+from agentic_sandbox import SandboxClient
+
 import kubernetes as k8s
 from kubernetes.watch import Watch
 
@@ -70,6 +72,8 @@ class GkeCodeExecutor(BaseCodeExecutor):
   namespace: str = "default"
   image: str = "python:3.11-slim"
   timeout_seconds: int = 300
+  executor_type: str = "job"  # "job" or "sandbox"
+  sandbox_gateway_name: str | None = None
   cpu_requested: str = "200m"
   mem_requested: str = "256Mi"
   # The maximum CPU the container can use, in "millicores". 1000m is 1 full CPU core.
@@ -84,6 +88,8 @@ class GkeCodeExecutor(BaseCodeExecutor):
 
   def __init__(
       self,
+      executor_type: str = "job",
+      sandbox_gateway_name: str | None = None,
       kubeconfig_path: str | None = None,
       kubeconfig_context: str | None = None,
       **data,
@@ -96,6 +102,8 @@ class GkeCodeExecutor(BaseCodeExecutor):
     3. Automatically via the default local kubeconfig file (~/.kube/config).
     """
     super().__init__(**data)
+    self.executor_type = executor_type
+    self.sandbox_gateway_name = sandbox_gateway_name
     self.kubeconfig_path = kubeconfig_path
     self.kubeconfig_context = kubeconfig_context
 
@@ -136,11 +144,29 @@ class GkeCodeExecutor(BaseCodeExecutor):
     self._batch_v1 = client.BatchV1Api()
     self._core_v1 = client.CoreV1Api()
 
-  def execute_code(
-      self,
-      invocation_context: InvocationContext,
-      code_execution_input: CodeExecutionInput,
-  ) -> CodeExecutionResult:
+  def _execute_in_sandbox(self, code: str) -> CodeExecutionResult:
+    """Executes code using Agent Sandbox Client."""
+    try:
+        with SandboxClient(
+            template_name="python-sandbox-template",
+            gateway_name=self.sandbox_gateway_name,
+            namespace=self.namespace
+        ) as sandbox:
+            # Execute the code as a python script
+            logging.debug("Executing code in sandbox:\n```\n%s\n```", code)
+            sandbox.write("script.py", code)
+            result = sandbox.run("python3 script.py")
+                
+            return CodeExecutionResult(
+                stdout=result.stdout,
+                stderr=result.stderr if result.stderr else None
+            )
+    except Exception as e:
+        return CodeExecutionResult(
+            stderr=f"Sandbox execution failed: {str(e)}",
+        )
+
+  def _execute_as_job(self, code: str, invocation_context: InvocationContext) -> CodeExecutionResult:
     """Orchestrates the secure execution of a code snippet on GKE."""
     job_name = f"adk-exec-{uuid.uuid4().hex[:10]}"
     configmap_name = f"code-src-{job_name}"
@@ -150,7 +176,7 @@ class GkeCodeExecutor(BaseCodeExecutor):
       # 1. Create a ConfigMap to mount LLM-generated code into the Pod.
       # 2. Create a Job that runs the code from the ConfigMap.
       # 3. Set the Job as the ConfigMap's owner for automatic cleanup.
-      self._create_code_configmap(configmap_name, code_execution_input.code)
+      self._create_code_configmap(configmap_name, code)
       job_manifest = self._create_job_manifest(
           job_name, configmap_name, invocation_context
       )
@@ -162,7 +188,7 @@ class GkeCodeExecutor(BaseCodeExecutor):
       logger.info(
           f"Submitted Job '{job_name}' to namespace '{self.namespace}'."
       )
-      logger.debug("Executing code:\n```\n%s\n```", code_execution_input.code)
+      logger.debug("Executing code:\n```\n%s\n```", code)
       return self._watch_job_completion(job_name)
 
     except ApiException as e:
@@ -185,6 +211,22 @@ class GkeCodeExecutor(BaseCodeExecutor):
       return CodeExecutionResult(
           stderr=f"An unexpected executor error occurred: {e}"
       )
+
+  def execute_code(
+      self,
+      invocation_context: InvocationContext,
+      code_execution_input: CodeExecutionInput,
+  ) -> CodeExecutionResult:
+
+    """Overrides the base method to route execution based on executor_type."""
+        
+    code = code_execution_input.code
+        
+    if self.executor_type == "sandbox":
+        return self._execute_in_sandbox(code)
+    else:
+        # Fallback to existing GKE Job logic
+        return self._execute_as_job(code, invocation_context)
 
   def _create_job_manifest(
       self,
